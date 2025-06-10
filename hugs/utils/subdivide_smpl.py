@@ -12,14 +12,18 @@ from trimesh.geometry import faces_to_edges
 
 from hugs.models.modules.smpl_layer import SMPL
 
-
+# subdivide 函数实现的是一种 面片细分（mesh subdivision） 算法，用于将三角面网格（如 SMPL 的 mesh）细化：
+# 通过对三角形的边缘中点插值生成新的顶点，再重建出更多、更小的三角形。这个方法类似于 Loop subdivision 里的 “midpoint insertion + face subdivision” 思路。
+# 将一个由三角面片组成的粗网格（coarse mesh），细分为一个更密集、更精细的网格，并将顶点属性（如 LBS 权重、shape directions 等）同步插值。
 def subdivide(
-    vertices,
-    faces,              
-    face_index=None,               
-    vertex_attributes=None
+    vertices, # 原始顶点坐标 (N, 3)  
+    faces,    # 三角面片索引 (M, 3)
+    face_index=None,            # 可选：只细分特定面片     
+    vertex_attributes=None       # 可选：附加属性（如 lbs_weights 等）
 ):     
     
+    # 若 face_index=None，默认细分所有面片。    
+    # 否则，只细分部分三角面。
     if face_index is None:         
         face_mask = np.ones(len(faces), dtype=bool)     
     else:         
@@ -28,13 +32,27 @@ def subdivide(
         
     # the (c, 3) int array of vertex indices     
     faces_subset = faces[face_mask]      
-    # find the unique edges of our faces subset     
+    
+    # find the unique edges of our faces subset    
+    # ② 找出细分三角形中的所有边
+    # 利用 faces_to_edges 提取所有边（三角形3条边）
+    # 利用 grouping.unique_rows 找到唯一边缘，避免重复插值
     edges = np.sort(faces_to_edges(faces_subset), axis=1)     
-    unique, inverse = grouping.unique_rows(edges)     
-    # then only produce one midpoint per unique edge     
+    unique, inverse = grouping.unique_rows(edges)    
+    
+    # then only produce one midpoint per unique edge 
+    # ③ 插入中点（Midpoint Insertion）
+    # 对每条唯一边插入一个中点，记作新的顶点
+    # 每个三角形生成3个中点，对应三个边
     mid = vertices[edges[unique]].mean(axis=1)     
-    mid_idx = inverse.reshape((-1, 3)) + len(vertices)      
+    mid_idx = inverse.reshape((-1, 3)) + len(vertices)   
+    
+    # ④ 构建新的三角面片
     # the new faces_subset with correct winding     
+    # A -> AB_mid -> AC_mid  
+    # AB_mid -> B -> BC_mid  
+    # AC_mid -> BC_mid -> C  
+    # AB_mid -> BC_mid -> AC_mid
     f = np.column_stack(
         [         
             faces_subset[:, 0],         
@@ -53,11 +71,13 @@ def subdivide(
     
     # add the 3 new faces_subset per old face all on the end     
     # # by putting all the new faces after all the old faces     
-    # # it makes it easier to understand the indexes     
+    # # it makes it easier to understand the indexes   
+    # ⑤ 合并旧面片、新面片、新顶点
     new_faces = np.vstack((faces[~face_mask], f))     
     # stack the new midpoint vertices on the end     
     new_vertices = np.vstack((vertices, mid))    
-        
+
+    # ⑥ 插值所有顶点属性
     if vertex_attributes is not None:       
         new_attributes = {}       
         for key, values in vertex_attributes.items():
