@@ -222,6 +222,17 @@ class NeuManReader():
     def __init__(self):
         pass
 
+    #     | 参数名                 | 类型            | 说明                                                 |
+    # | ------------------- | ------------- | -------------------------------------------------- |
+    # | `scene_dir`         | str           | 场景主目录（包含 `images/`, `sparse/`, `depth_maps/` 等子目录） |
+    # | `tgt_size`          | tuple or None | 图像目标尺寸，用于 resize 图像                                |
+    # | `normalize`         | bool          | 是否对场景进行归一化（调整相机坐标缩放）                               |
+    # | `bkg_range_scale`   | float         | 背景区域的 near/far 范围缩放因子                              |
+    # | `human_range_scale` | float         | 人体区域的 near/far 范围缩放因子（目前默认未启用）                     |
+    # | `mask_dir`          | str           | 掩码图路径                                              |
+    # | `smpl_type`         | str           | SMPL 参数类型，如 `'romp'`, `'optimized'`                |
+    # | `keypoints_dir`     | str           | 关键点路径目录                                            |
+    # | `densepose_dir`     | str           | DensePose 路径目录                                     |
     @classmethod
     def read_scene(cls, scene_dir, tgt_size=None, normalize=False, bkg_range_scale=1.1, human_range_scale=1.1, mask_dir='segmentations', smpl_type='romp', keypoints_dir='keypoints', densepose_dir='densepose'):
         def update_near_far(scene, keys, range_scale):
@@ -248,9 +259,30 @@ class NeuManReader():
                         length = (far - near) * range_scale
                         cur_cap.near[k] = max(0.0, float(center - length / 2))
                         cur_cap.far[k] = float(center + length / 2)
+                        
+        # read_captures(...) 从 images/ 和 sparse/ 中读取：
+        # 每帧的 RGB 图像路径、深度图路径、相机内参、位姿等；
+        # 返回 captures（一个 NeuManCapture 对象列表）；
+        # 构造 RigCameraScene 对象，表示整个场景。
+        # ✅ 输出：scene.captures, scene.point_cloud, scene.num_views
         captures, point_cloud, num_views, num_cams = cls.read_captures(scene_dir, tgt_size, mask_dir=mask_dir, keypoints_dir=keypoints_dir, densepose_dir=densepose_dir)
+        
+        # 构造一个多摄像头-多视角场景对象，用于统一管理和访问每一帧的图像、深度图、相机参数以及对应的三维点云数据。
+        # scene.get_captures_by_view_id(3)     # 第4帧的图像信息（view 3）
+        # scene.get_capture_by_view_cam_id(5, 0)  # 第6帧第0个摄像头的采集信息
+        # scene.point_cloud   # 如果有提供点云数据
+        # scene[3]            # 也可以按索引访问 captures
         scene = scene_module.RigCameraScene(captures, num_views, num_cams)
+        
         scene.point_cloud = point_cloud
+        
+        # 根据场景中背景点云的位置，自动计算每一帧相机在渲染“背景（bkg）”时所需的 near / far clipping plane（近平面/远平面），并设置到每个 capture（帧）中。
+        # 📌 最终效果
+        #     每一个 capture（每帧图像）将拥有如下属性：
+        # 投影到当前视图相机坐标系下，取出所有点的 z 值（深度）
+        #     capture.near = {'bkg': 0.3, 'human': 0.2}
+        #     capture.far  = {'bkg': 5.1, 'human': 2.3}
+        #     用于后续渲染或训练过程中的视锥体裁剪计算（即 Frustum）。
         update_near_far(scene, ['bkg'], bkg_range_scale)
 
         if normalize:
@@ -359,38 +391,93 @@ class NeuManReader():
 
     @classmethod
     def read_captures(cls, scene_dir, tgt_size, mask_dir='segmentations', keypoints_dir='keypoints', densepose_dir='densepose'):
+    # 作用是从指定场景路径中读取并封装每帧图像的相机参数、深度图、掩码、关键点、densepose 等信息，并生成 NeuManCapture 或 ResizedNeuManCapture 对象列表作为输出。
         caps = []
+        # 1️⃣ 使用 COLMAP 工具加载基础相机与图像结构
+        # 输入：
+        # scene_dir/sparse: COLMAP 的 .txt 相机和位姿输出；
+        # scene_dir/images: 图像序列所在路径；
+        # tgt_size: 可选图像缩放尺寸，如 (512, 512)。
+        # 输出（raw_scene 是 RigCameraScene 实例）：
+        # raw_scene.captures: List[Capture]
+        # raw_scene.point_cloud: np.ndarray, shape = (N, 6)  # xyzrgb
         raw_scene = colmap_helper.ColmapAsciiReader.read_scene(
             os.path.join(scene_dir, 'sparse'),
             os.path.join(scene_dir, 'images'),
             tgt_size,
             order='video',
         )
-        num_views = len(raw_scene.captures)
-        num_cams = 1
-        counter = 0
+
+        # 2️⃣ 初始化参数
+        num_views = len(raw_scene.captures)  # 视角数（等于图像数）
+        num_cams = 1 # 默认单摄像头
+        counter = 0 # 图像帧编号计数器
+        
         for view_id in range(num_views):
             for cam_id in range(num_cams):
                 raw_cap = raw_scene.captures[counter]
+                
+                # 4️⃣ 构造该帧对应的其他数据路径（depth, mono_depth, mask, keypoints, densepose）
+                # raw_cap.image_path: '.../images/00003.jpg'
+                # depth_path:         '.../depth_maps/00003.jpg.geometric.bin'
+                # mono_depth_path:    '.../mono_depth/00003.jpg'
+
+                # ✅ 1. depth_path: 多视图几何深度图（MVS Depth）
+                # 来源：来自 COLMAP 等多视图立体（Multi-View Stereo, MVS）算法。 预先得到的
+                # 输入数据：使用同一场景中多张图像，从不同角度三角化计算深度。
+                # 优点：
+                # 通常精度高，特别是表面几何结构清晰时。
+                # 缺点：
+                # 对纹理敏感区域效果好，但在遮挡、低纹理或人身上经常失败或缺失。
+                # 存在“洞”或稀疏区域。
+                # 文件格式：通常是 .geometric.bin 或 .pfm 等二进制格式。
                 depth_path = raw_cap.image_path.replace('/images/', '/depth_maps/') + '.geometric.bin'
+                # ✅ 2. mono_depth_path: 单目深度图（Monocular Depth） 
+                # 来源：来自训练好的单目深度估计网络，如 MiDaS、DPT、LeReS。  预先得到的
+                # 输入数据：只依赖单张图像，无需多视角。
                 mono_depth_path = raw_cap.image_path.replace('/images/', '/mono_depth/')
+
                 if not os.path.isfile(depth_path):
                     depth_path = raw_cap.image_path + 'dummy'
                     print(f'can not find mvs depth for {os.path.basename(raw_cap.image_path)}')
                 if not os.path.isfile(mono_depth_path):
                     mono_depth_path = raw_cap.image_path + 'dummy'
                     print(f'can not find mono depth for {os.path.basename(raw_cap.image_path)}')
+
+                
+                # 这三个路径变量分别对应图像中人体区域的分割掩码（mask）、人体关键点（keypoints）和DensePose 表示（densepose）。
+                # ✅ mask_path：人体掩码图（Segmentation Mask）
+                #     作用：指定图像中属于“人”的区域。用于：
+                #     剔除背景（训练时聚焦于人）
+                #     对人体区域单独监督优化
+                #     格式：
+                #     npy 文件：形如 000001.jpg.npy
+                #     或图像文件：000001.jpg.png
+                #     内容：灰度图（一般为 0 表示背景，255 表示人体）
                 mask_path = os.path.join(scene_dir, mask_dir, os.path.basename(raw_cap.image_path) + '.npy')
                 if not os.path.isfile(mask_path):
                     mask_path = os.path.join(scene_dir, mask_dir, os.path.basename(raw_cap.image_path))
+
+                # ✅ keypoints_path：人体2D关键点（e.g. COCO格式）
+                #     作用：
+                #     提供人体骨骼结构约束信息
+                #     可用于监督姿态估计或优化初始化
+                #     格式：.npy 文件（通常是 17 × 3 数组，表示17个关键点的 x, y, confidence）
                 keypoints_path = os.path.join(scene_dir, keypoints_dir, os.path.basename(raw_cap.image_path) + '.npy')
                 if not os.path.isfile(keypoints_path):
                     print(f'can not find keypoints for {os.path.basename(raw_cap.image_path)}')
                     keypoints_path = None
+
+                # ✅ densepose_path：DensePose 表示（人体像素级 UV 坐标）
+                #     作用：
+                #     每个人体像素对应一个 SMPL 网格上的 UV 坐标和 part label
+                #     提供像素级的高密度语义约束，用于精细建模
                 densepose_path = os.path.join(scene_dir, densepose_dir, 'dp_' + os.path.basename(raw_cap.image_path) + '.npy')
                 if not os.path.isfile(densepose_path):
                     print(f'can not find densepose for {os.path.basename(raw_cap.image_path)}')
                     densepose_path = None
+                    
+                # 6️⃣ 根据是否指定 tgt_size 选择使用 NeuManCapture 还是 ResizedNeuManCapture
                 if tgt_size is None:
                     temp = NeuManCapture(
                         raw_cap.image_path,
@@ -421,4 +508,6 @@ class NeuManReader():
                 temp.frame_id = raw_cap.frame_id
                 counter += 1
                 caps.append(temp)
+            
+        # raw_scene.point_cloud：points3D.txt
         return caps, raw_scene.point_cloud, num_views, num_cams
