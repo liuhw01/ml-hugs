@@ -29,6 +29,26 @@ from hugs.utils.general import (
     build_scaling_rotation,
 )
 
+# 🧱 初始化流程 create_from_pcd(pcd, spatial_lr_scale)
+# 给定一个 Open3D 点云对象，初始化所有高斯属性：
+
+# 🚀 forward 输出（供渲染器使用）
+
+# 🌱 优化器 setup
+# setup_optimizer(cfg) 为每个属性构建优化项并记录其学习率：
+
+# 🌐 稠密化与裁剪 densify_and_*
+# densify_and_split: 基于梯度大的点 clone 并 perturb，增加细节
+# densify_and_clone: 直接复制原有点（适合不需要变化时）
+# densify_and_prune: 结合最大透明度、投影尺寸裁剪点云
+# prune_points: 对应张量和 optimizer 状态同步裁剪
+# cat_tensors_to_optimizer: 添加新点同步到优化器中
+
+# 💾 存取接口
+# save_ply(path): 保存当前状态为 .ply 格式
+# load_ply(path): 从 .ply 加载全部属性
+# state_dict(): 提供可序列化的模型参数
+# restore(state_dict, cfg): 用于 checkpoint 加载恢复状态
 
 class SceneGS:
 
@@ -163,34 +183,54 @@ class SceneGS:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
+    # 🧱 初始化流程 create_from_pcd(pcd, spatial_lr_scale)
+    # 给定一个 Open3D 点云对象，初始化所有高斯属性：
+    # ✅ 输入：
+    #     pcd: 一个 open3d.geometry.PointCloud，含有：
+    #         points: N×3，点的位置
+    #         colors: N×3，RGB 颜色（范围 0~1）
     def create_from_pcd(self, pcd, spatial_lr_scale: float):
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-        
+
+        # → 如果启用 SH（球谐），则将 RGB 转为球谐基系数（用于方向感知的颜色建模）
         if self.only_rgb:
             fused_color = torch.tensor(np.asarray(pcd.colors)).float().cuda()
         else:
             fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
-            
-        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
-        features[:, :3, 0 ] = fused_color
-        features[:, 3:, 1:] = 0.0
+
+        # 1. 颜色 → 球谐系数（Spherical Harmonics）
+        # features_dc: [..., 0]，表示每个点的 RGB 常量分量
+        # features_rest: [..., 1:]，高阶球谐分量（先置0，训练中学习
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda() # (N, RGB通道, SH通道数)
+        features[:, :3, 0 ] = fused_color  # 填入直流项 DC：对应 SH 的第0阶（常数项）
+        features[:, 3:, 1:] = 0.0   # 其余阶全部置零
+        
             
         logger.info(f'Number of scene points at initialisation: {fused_point_cloud.shape[0]}')
 
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
-        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        # 3️⃣ 初始化 scale 参数（控制高斯形状大小）
+        # 对应协方差矩阵主轴方向的 scale，初始值越远，越“模糊”
+        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)   # 最近邻距离平方，避免为0
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)  # 取 log√d 作为尺度（三轴共享）
+
+        # 4️⃣ 初始化 rotation 为单位四元数（无旋转）
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
+        # 5️⃣ 初始化 opacity 透明度
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
+        # 6️⃣ 注册为可训练参数
+        # 初始化时高斯的位置（_xyz）和输入点云的坐标完全一致。
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
+
+        # 7️⃣ 初始化 2D 投影半径（用于渲染时判断遮挡/密度）
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def setup_optimizer(self, cfg):
