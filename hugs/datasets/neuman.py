@@ -58,7 +58,11 @@ def get_data_splits(scene):
     assert len(val_list) > 0    
     return train_list, val_list, test_list
 
-
+# ✅ 场景适配目的
+# 这个函数的设计是为了：
+# 给不同的场景分配不同的动作序列（如跳舞、跑步、翻滚等）
+# 控制使用的帧数范围和采样速率
+# 方便用于驱动 SMPL 模型生成特定动态
 def mocap_path(scene_name):
     # ./data/MoSh/MPI_mosh/50027/misc_dancing_hiphop_poses.npz
     if os.path.basename(scene_name) == 'seattle': # and opt.motion_name == 'moonwalk':
@@ -196,7 +200,11 @@ class NeumanDataset(torch.utils.data.Dataset):
         bg_sphere_dist=5.0,
         clean_pcd=False,
     ):
+        # dataset_path='data/neuman/dataset'
+        # seq=lab
         dataset_path = f"{NEUMAN_PATH}/{seq}"
+
+        # scene: 包含图像帧、相机参数、点云、尺寸信息的对象；
         scene = neuman_helper.NeuManReader.read_scene(
             dataset_path,
             tgt_size=None,
@@ -204,9 +212,17 @@ class NeumanDataset(torch.utils.data.Dataset):
             smpl_type='optimized'
         )
         
+        # smpl_params([
+        #     'pose',          # (N, 72)
+        #     'betas',         # (N, 10)
+        #     'trans',         # (N, 3)
+        #     'scale',         # float 或 shape=(1,)
+        #     'gender'         # str 或 int (0, 1, 2)
+        # ])
         smpl_params_path = f'{dataset_path}/4d_humans/smpl_optimized_aligned_scale.npz'        
         smpl_params = np.load(smpl_params_path)
         smpl_params = {f: smpl_params[f] for f in smpl_params.files}
+
         
         if split == 'anim':
             motion_path, start_idx, end_idx, skip = mocap_path(seq)
