@@ -96,6 +96,33 @@ class GaussianTrainer():
                 init_betas = torch.stack([x['betas'] for x in self.train_dataset.cached_data], dim=0)
                 self.human_gs.create_betas(init_betas[0], cfg.human.optim_betas)
                 self.human_gs.initialize()
+            
+            #             | 参数名                          | 含义                                       |
+            # | ---------------------------- | ---------------------------------------- |
+            # | `name: hugs_trimlp`          | 使用的是 `HUGS_TRIMLP` 类                     |
+            # | `ckpt: null`                 | 没有预加载的 checkpoint，用于从头开始训练               |
+            # | `sh_degree: 0`               | 不使用 spherical harmonics（SH）来建模颜色（因为设置为0） |
+            # | `n_subdivision: 2`           | 初始网格进行2次 subdivision，用于生成更密集的高斯点         |
+            # | `only_rgb: false`            | 不仅仅优化 RGB，还可能涉及透明度、LBS 等属性               |
+            # | `use_surface: false`         | 不使用 mesh 表面约束（默认是点云优化）                   |
+            # | `use_deformer: true`         | 使用可变形模型（例如 SMPL-LBS）来驱动高斯变形              |
+            # | `init_2d: false`             | 不使用2D图像初始化高斯点（用的是3D初始化）                  |
+            # | `disable_posedirs: true`     | 不使用 pose blend shape（简化模型）               |
+            # | `res_offset: false`          | 是否使用残差偏移建模，关闭                            |
+            # | `rotate_sh: false`           | 是否让 SH 旋转以匹配姿态，这里关闭                      |
+            # | `isotropic: false`           | 高斯是否为各向同性（否，保持完整协方差）                     |
+            # | `init_scale_multiplier: 0.5` | 高斯初始缩放因子（影响渲染模糊度）                        |
+            # | `run_init: false`            | 启动时是否初始化（后面代码里有单独控制）                     |
+            # | `estimate_delta: true`       | 是否估计 shape 残差                            |
+            # | `triplane_res: 256`          | 三平面体素网络分辨率                               |
+            # | `optim_pose: true`           | 是否优化姿态参数                                 |
+            # | `optim_betas: false`         | 是否优化 shape 参数 β（这里关闭，只使用初始的）             |
+            # | `optim_trans: true`          | 优化位移参数                                   |
+            # | `optim_eps_offsets: false`   | 是否优化 epsilon 偏移量（关闭）                     |
+            # | `activation: relu`           | 三平面 MLP 中使用 ReLU 激活函数                    |
+            # | `canon_nframes: 60`          | 用于生成 canonical pose 的帧数                  |
+            # | `canon_pose_type: da_pose`   | 选择 canonical pose 类型                     |
+            # | `knn_n_hops: 3`              | 用于构建 knn 图结构的 hop 数                      |
             elif cfg.human.name == 'hugs_trimlp':
                 init_betas = torch.stack([x['betas'] for x in self.val_dataset.cached_data], dim=0)
                 self.human_gs = HUGS_TRIMLP(
