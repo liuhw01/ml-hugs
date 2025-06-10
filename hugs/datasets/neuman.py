@@ -332,12 +332,15 @@ class NeumanDataset(torch.utils.data.Dataset):
         )
 
         # 人体点（即动态人身体对应的高斯）是单独建模的：它们初始放置在 SMPL 网格顶点位置
+        # 这几个参数是用来驱动 SMPL 模型的标准输入项，用于生成与人体姿态和形体相关的3D网格。它们的含义如下：
         # 字段包括：
-        #     global_orient: N × 3
-        #     body_pose: N × 69
-        #     transl: N × 3
-        #     betas: N × 10
-        #     scale: N × 1
+        # | 参数名             | 维度     | 含义         | 功能描述                           |
+        # | --------------- | ------ | ---------- | ------------------------------ |
+        # | `global_orient` | N × 3  | 全局朝向       | 控制整个身体在三维空间中的旋转（轴角格式）          |
+        # | `body_pose`     | N × 69 | 身体姿态       | 控制23个身体关节的局部旋转（每个关节3维轴角，共69维）  |
+        # | `transl`        | N × 3  | 平移向量       | 控制人体在三维空间中的位置                  |
+        # | `betas`         | N × 10 | 形状参数（个体特征） | 控制人体的个性化形状（身高、胖瘦、比例等），来自PCA主成分 |
+        # | `scale`         | N × 1  | 全局缩放因子     | 对整个模型进行统一的缩放调整，以适应不同数据或场景      |
         self.smpl_params = {}
         for k in smpl_params.keys():
             self.smpl_params[k] = torch.from_numpy(smpl_params[k]).float()
