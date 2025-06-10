@@ -51,6 +51,42 @@ class SMPLOutput(ModelOutput):
     v_posed: Optional[Tensor] = None
     v_shaped: Optional[Tensor] = None
 
+# 这段代码是一个 PyTorch 模块 SMPL 的实现，其功能是将：
+# 人体参数（shape+pose） ➝ 3D人体网格（vertices）和关节（joints）
+
+# | 模块作用                           | 解释                                                            |
+# | ------------------------------ | ------------------------------------------------------------- |
+# | ✅ 读取并加载 `.pkl` 格式的 SMPL 模型文件   | 包含基础 mesh、blend shapes、pose blend shapes、regressor 等          |
+# | ✅ 注册成 `torch.nn.Module` 可学习模块  | 支持与其他神经网络协同训练                                                 |
+# | ✅ 封装多个 forward 模式              | `forward`, `forward_shape`, `forward_pose`, `forward_extra` 等 |
+# | ✅ 支持灵活输入 pose、betas、transl 等参数 | 适配各种训练/测试任务                                                   |
+
+# 🧰 二、主要成员变量一览（构造时注册）
+# | 属性名                                             | 功能                           |
+# | ----------------------------------------------- | ---------------------------- |
+# | `v_template`                                    | SMPL 模板网格 (T-pose 下的顶点位置)    |
+# | `shapedirs`                                     | 形状空间基（PCA basis），控制身材变化      |
+# | `posedirs`                                      | 姿态空间基，控制姿势引起的局部变形            |
+# | `J_regressor`                                   | 从 `v_shaped` 中线性回归出 3D 关节点位置 |
+# | `lbs_weights`                                   | LBS 权重，用于关节驱动顶点变形            |
+# | `parents`                                       | Kinematic tree 定义，用于计算关节变换   |
+# | `betas`, `body_pose`, `global_orient`, `transl` | 默认模型参数，支持 forward 时省略输入      |
+
+# 🚦 三、几个关键方法说明
+# 1. forward(...)【主入口】
+# 输入完整的 pose、shape、transl 参数，输出 3D mesh + joints + transformation：
+# smpl_output = smpl_model（）
+# 输出类型是 SMPLOutput，包含 .vertices, .joints, .A, .T 等信息。
+
+# 2. forward_shape(...)
+# 只输入 betas（形状参数），得到只受身材影响的 v_shaped。可用于分析形状空间。
+
+# 3. forward_pose(...)
+# 输入 pose 和 betas，不含 posedirs 的禁用功能（或配合 disable_posedirs=True 使用）。
+
+# 4. forward_extra(...)
+# 允许手动传入 posedirs、v_template、lbs_weights 等，适配修改过的 SMPL 模型，比如你通过 subdivision 改过顶点。
+
 
 class SMPL(nn.Module):
 
