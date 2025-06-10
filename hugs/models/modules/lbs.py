@@ -93,6 +93,12 @@ def lbs_extra(
     
     # verts：最终变形后的顶点位置 (B, N, 3)。
     verts = v_homo[:, :, :3, 0]
+
+        # verts：变形后顶点位置 (B, N, 3)
+        # A：输入的关节变换 (B, J, 4, 4)
+        # T：每点的 LBS 变换矩阵 (B, N, 4, 4)
+        # v_posed：加上 pose_offsets 后的点位置 (B, N, 3)
+        # v_shaped：原始输入点 (B, N, 3)
     return verts, A, T, v_posed, v_shaped
 
 
