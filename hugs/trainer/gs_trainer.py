@@ -165,15 +165,30 @@ class GaussianTrainer():
                     logger.info(f'Loaded human model from {ckpt_files[-1]}')
 
             if not cfg.eval:
+                  # 字段包括：
+                # | 参数名             | 维度     | 含义         | 功能描述                           |
+                # | --------------- | ------ | ---------- | ------------------------------ |
+                # | `global_orient` | N × 3  | 全局朝向       | 控制整个身体在三维空间中的旋转（轴角格式）          |
+                # | `body_pose`     | N × 69 | 身体姿态       | 控制23个身体关节的局部旋转（每个关节3维轴角，共69维）  |
+                # | `transl`        | N × 3  | 平移向量       | 控制人体在三维空间中的位置                  |
+                # | `betas`         | N × 10 | 形状参数（个体特征） | 控制人体的个性化形状（身高、胖瘦、比例等），来自PCA主成分 |
+                # | `scale`         | N × 1  | 全局缩放因子     | 对整个模型进行统一的缩放调整，以适应不同数据或场景      |
                 init_smpl_global_orient = torch.stack([x['global_orient'] for x in self.train_dataset.cached_data])
-                init_smpl_body_pose = torch.stack([x['body_pose'] for x in self.train_dataset.cached_data])
-                init_smpl_trans = torch.stack([x['transl'] for x in self.train_dataset.cached_data], dim=0)
-                init_betas = torch.stack([x['betas'] for x in self.train_dataset.cached_data], dim=0)
+                init_smpl_body_pose = torch.stack([x['body_pose'] for x in self.train_dataset.cached_data])   # 把每帧的 body_pose（形状 (69,)）堆成 (N, 69)。
+                init_smpl_trans = torch.stack([x['transl'] for x in self.train_dataset.cached_data], dim=0) # 把每帧的 transl（(3,)）堆成 (N, 3)。  
+                init_betas = torch.stack([x['betas'] for x in self.train_dataset.cached_data], dim=0) 
                 init_eps_offsets = torch.zeros((len(self.train_dataset), self.human_gs.n_gs, 3), 
                                             dtype=torch.float32, device="cuda")
-
+                
+                # 在模型中创建可学习的 betas 参数
+                # 取 init_betas[0]（第一个样本的形状参数）作为初始值。
+                # cfg.human.optim_betas 控制是否对 betas 打开梯度及学习率。
                 self.human_gs.create_betas(init_betas[0], cfg.human.optim_betas)
                 
+                # 在模型中逐项创建并初始化 SMPL 参数
+                #     create_body_pose：将 (N,69) 的 body_pose 注册为可学习参数，梯度由 cfg.human.optim_pose 控制。
+                #     create_global_orient：将 (N,3) 的 global_orient 注册为可学习参数。
+                #     create_transl：将 (N,3) 的 transl 注册为可学习参数，梯度由 cfg.human.optim_trans 控制。
                 self.human_gs.create_body_pose(init_smpl_body_pose, cfg.human.optim_pose)
                 self.human_gs.create_global_orient(init_smpl_global_orient, cfg.human.optim_pose)
                 self.human_gs.create_transl(init_smpl_trans, cfg.human.optim_trans)
