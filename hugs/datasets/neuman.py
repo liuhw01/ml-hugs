@@ -181,6 +181,13 @@ def rendering_caps(scene_name, nframes, scene):
 
 
 class NeumanDataset(torch.utils.data.Dataset):
+    
+    #     | 参数名             | 说明                                              |
+    # | --------------- | ----------------------------------------------- |
+    # | `seq`           | 序列名，如 `'seattle'`，用于定位数据路径                      |
+    # | `split`         | 数据划分：`'train'`, `'val'`, `'anim'`               |
+    # | `render_mode`   | 渲染模式，控制渲染区域（例如 `human_scene`, `scene`, `human`） |
+    # | `add_bg_points` | 是否添加背景球点云（用于构建完整球壳环境）                           |
     def __init__(
         self, seq, split, 
         render_mode='human_scene',
