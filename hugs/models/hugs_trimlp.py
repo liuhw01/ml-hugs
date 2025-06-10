@@ -37,6 +37,13 @@ from .modules.decoders import AppearanceDecoder, DeformationDecoder, GeometryDec
 
 SCALE_Z = 1e-5
 
+# 初始化时会调用：
+# TriPlane 三平面体素编码器
+# AppearanceDecoder 外观解码器（生成 SH 系数和透明度）
+# GeometryDecoder 几何解码器（生成偏移、旋转、尺度）
+# DeformationDecoder 形变解码器（生成 LBS 权重和 posedirs）
+
+
 
 class HUGS_TRIMLP:
 
@@ -56,7 +63,15 @@ class HUGS_TRIMLP:
         self.inverse_opacity_activation = inverse_sigmoid
 
         self.rotation_activation = torch.nn.functional.normalize
-
+        
+    # | 参数名                                | 作用                                  |
+    # | ---------------------------------- | ----------------------------------- |
+    # | `sh_degree`                        | 最大 spherical harmonics 阶数，用于建模高斯的颜色 |
+    # | `n_subdivision`                    | SMPL 模板网格细分次数，增加高斯点数                |
+    # | `init_2d`, `use_surface`           | 控制高斯初始化方式：是否用2D特征或表面法向做限制           |
+    # | `use_deformer`, `disable_posedirs` | 是否使用 SMPL 的 LBS（线性 blendshape）机制    |
+    # | `triplane_res`, `n_features`       | 三平面特征分辨率及通道数，用于体积编码                 |
+    # | `betas`                            | SMPL shape 参数初始值                    |
     def __init__(
         self, 
         sh_degree: int, 
@@ -107,6 +122,8 @@ class HUGS_TRIMLP:
         
         if n_subdivision > 0:
             logger.info(f"Subdividing SMPL model {n_subdivision} times")
+            # 生成更密集的高斯初始化点，通过网格细分让高斯点分布更均匀、更细致，从而提升渲染质量与形变表达能力。
+            # subdivide_smpl_model(...)  ⟶  _subdivide_smpl_model(...)  ⟶  subdivide(...)
             self.smpl_template = subdivide_smpl_model(smoothing=True, n_iter=n_subdivision).to(self.device)
         else:
             self.smpl_template = SMPL(SMPL_PATH).to(self.device)
@@ -578,6 +595,7 @@ class HUGS_TRIMLP:
     
     @torch.no_grad()
     def get_vitruvian_verts_template(self):
+        
         vitruvian_pose = torch.zeros(69, dtype=self.smpl_template.dtype, device=self.device)
         vitruvian_pose[2] = 1.0
         vitruvian_pose[5] = -1.0
@@ -592,26 +610,41 @@ class HUGS_TRIMLP:
         pass
     
     def initialize(self):
+        # 1️⃣ 顶点位置初始化
+        # 获取 SMPL 模板下 Vitruvian pose（即“标准姿态”）对应的所有顶点位置，作为高斯初始中心。
         t_pose_verts = self.get_vitruvian_verts_template()
-        
+
+        # 初始化每个高斯点的尺度倍率（可学习项）
         self.scaling_multiplier = torch.ones((t_pose_verts.shape[0], 1), device="cuda")
-        
+
+        # 初始化偏移为 0，意味着初始位置就是 SMPL Vitruvian 模板的顶点位置
         xyz_offsets = torch.zeros_like(t_pose_verts)
+        # 初始化颜色， 所有高斯点颜色初始化为灰色 (0.5, 0.5, 0.5)
         colors = torch.ones_like(t_pose_verts) * 0.5
-        
+
+        # 初始化 spherical harmonics（SH）系数，维度为 [num_points, 16, 3]
+            # 仅第 0 阶（常数项）为非零，设置为灰色
         shs = torch.zeros((colors.shape[0], 3, 16)).float().cuda()
         shs[:, :3, 0 ] = colors
         shs[:, 3:, 1:] = 0.0
         shs = shs.transpose(1, 2).contiguous()
-        
+
+        # 初始化每个高斯点的 3D 尺度为 0（将在下方计算）
         scales = torch.zeros_like(t_pose_verts)
+
+        
         for v in range(t_pose_verts.shape[0]):
+            # 查找与当前顶点 v 相连的所有边
             selected_edges = torch.any(self.edges == v, dim=-1)
+            # 计算所有相连边的长度（用于估算局部几何大小）
             selected_edges_len = torch.norm(
                 t_pose_verts[self.edges[selected_edges][0]] - t_pose_verts[self.edges[selected_edges][1]], 
                 dim=-1
             )
+            # 缩放边长，用于控制初始化尺度大小（默认 init_scale_multiplier=0.5）
             selected_edges_len *= self.init_scale_multiplier
+
+            # 设置高斯在 X 和 Y 方向的尺度，初始取最大边长，并取对数（因为后续会 exp 回去）
             scales[v, 0] = torch.log(torch.max(selected_edges_len))
             scales[v, 1] = torch.log(torch.max(selected_edges_len))
             
@@ -626,30 +659,52 @@ class HUGS_TRIMLP:
         if self.use_surface or self.init_2d:
             scale_z = torch.ones_like(scales[:, -1:]) * SCALE_Z
             scales = torch.cat([scales, scale_z], dim=-1)
-        
+
         import trimesh
+        # ✅ 构建 trimesh 网格对象，用 SMPL 模板的 T-pose 顶点和面构建网格，用于计算每个顶点的表面法向。
+            # t_pose_verts: 当前帧 SMPL 模板下的顶点坐标（Tensor）。
         mesh = trimesh.Trimesh(vertices=t_pose_verts.detach().cpu().numpy(), faces=self.smpl_template.faces)
+
+        # ✅ 获取每个顶点的单位法向向量，并转为 CUDA tensor，以便后续在 GPU 上与高斯默认法向对齐。
         vert_normals = torch.tensor(mesh.vertex_normals).float().cuda()
-        
+
+        # ✅ 构造所有高斯的默认初始法向向量，全设为 [0, 0, 1]（Z轴朝上），即假设初始高斯是垂直朝上的椭球体。
         gs_normals = torch.zeros_like(vert_normals)
         gs_normals[:, 2] = 1.0
-        
+
+        # ✅ 计算从默认法向 gs_normals 到真实表面法向 vert_normals 的旋转矩阵（每个高斯一个3×3矩阵）。
+        # 用于将高斯从“朝上”姿态旋转对齐到网格真实法向。
         norm_rotmat = torch_rotation_matrix_from_vectors(gs_normals, vert_normals)
 
+        # ✅ 将旋转矩阵转换为：
+        #     rotq: 四元数表示（用于插值等任务）
+        #     rot6d: 6D 旋转表示（避免欧拉角/Gimbal锁问题，适合网络学习）
         rotq = matrix_to_quaternion(norm_rotmat)
         rot6d = matrix_to_rotation_6d(norm_rotmat)
-                
+
+        # ✅ 存储原始默认法向（Z轴）为类成员，后续可用于对比和旋转。
         self.normals = gs_normals
+
+        # ✅ 将默认法向通过旋转矩阵 norm_rotmat 变换为对齐后的法向，结果即为每个高斯点在初始位置下的真实法向。
         deformed_normals = (norm_rotmat @ gs_normals.unsqueeze(-1)).squeeze(-1)
-        
+
+        # ✅ 初始化每个高斯点的不透明度（透明度）为常数 0.1，后续训练中可调。
         opacity = 0.1 * torch.ones((t_pose_verts.shape[0], 1), dtype=torch.float, device="cuda")
-        
+
+        # ✅ 获取 SMPL 模板中：
+        #     posedirs: 每个顶点在关节旋转时的形变方向（用于 LBS 插值）
+        #     lbs_weights: 每个顶点的 LBS 权重（对应骨骼的影响权重）
+        #     用于高斯形变时驱动每个高斯点的运动。
         posedirs = self.smpl_template.posedirs.detach().clone()
         lbs_weights = self.smpl_template.lbs_weights.detach().clone()
 
+        # ✅ 设置当前高斯点的数量为 SMPL 模板顶点数。
         self.n_gs = t_pose_verts.shape[0]
+
+        # ✅ 设置高斯中心为 SMPL Vitruvian pose 的顶点坐标，并启用梯度更新，用于后续优化。
         self._xyz = nn.Parameter(t_pose_verts.requires_grad_(True))
-        
+
+         # ✅ 初始化每个高斯点在视图空间中的最大投影半径为0（用于视锥裁剪等渲染加速策略），后续渲染中会更新该值。
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         return {
             'xyz_offsets': xyz_offsets,
