@@ -392,25 +392,7 @@ class HUGS_TRIMLP:
         # 由于外部变换只影响空间位置和旋转，不改变 spherical harmonics 系数，直接克隆一份即可。
         deformed_gs_shs = gs_shs.clone()
 
-#         | 状态                   | 说明                                                                                                             |
-# | -------------------- | -------------------------------------------------------------------------------------------------------------- |
-# | **Canonical**（规范化状态） | 顶点／高斯点处于 SMPL 模板定义的“标准”姿态下（通常是 Vitruvian pose 或 T-pose），只包含初始的形状偏移（shape\_offsets）和模型级别的模板参数，没有任何关节驱动的形变或外部变换。 |
-# | **Deformed**（变形后状态）  | 顶点／高斯点应用了骨骼绑定（LBS）、pose-dirs、全局旋转缩放平移，甚至可能再叠加了一次外部仿射变换之后的位置。                                                   |
 
-        # 返回字典
-        #     xyz: 变形并应用所有缩放、平移和外部变换后的高斯中心
-        #     xyz_canon: canonical（未变形）状态下的高斯中心
-        #     xyz_offsets: 几何偏移（geometry decoder 输出）
-        #     scales / scales_canon: 最终与 canonical 的尺度
-        #     rotq / rotmat: 变形后高斯的旋转（四元数和矩阵）
-        #     rotq_canon / rotmat_canon: canonical 姿态下的旋转
-        #     rot6d_canon: canonical 的 6D 旋转表示
-        #     shs: spherical harmonics 系数
-        #     opacity: 透明度
-        #     normals / normals_canon: 变形后与 canonical 下的法向
-        #     active_sh_degree: 当前 SH 阶数
-        #     lbs_weights, posedirs: 用于 LBS 的权重和偏移方向
-        #     gt_lbs_weights: SMPL 原生权重的 ground-truth，用于正则化
         return {
             'xyz': deformed_xyz,
             'xyz_canon': gs_xyz,
@@ -630,14 +612,37 @@ class HUGS_TRIMLP:
             deformed_gs_rotq = quaternion_multiply(rotq, deformed_gs_rotq)
             deformed_gs_rotmat = quaternion_to_matrix(deformed_gs_rotq)
         
+        # 构造一个与 gs_xyz 同 shape 的向量组，所有法向初始设为 (0,0,1)，表示 canonical 状态下的“上”方向。
         self.normals = torch.zeros_like(gs_xyz)
         self.normals[:, 2] = 1.0
-        
+
+        # canon_normals：将默认法向通过 canonical 旋转 gs_rotmat 变换，得到 canonical 姿态下每个高斯的真实法向。
         canon_normals = (gs_rotmat @ self.normals.unsqueeze(-1)).squeeze(-1)
+        # deformed_normals：再用最终的 posed 旋转 deformed_gs_rotmat 变换，得到变形后每个高斯的法向。
         deformed_normals = (deformed_gs_rotmat @ self.normals.unsqueeze(-1)).squeeze(-1)
-        
+        # 由于外部变换只影响空间位置和旋转，不改变 spherical harmonics 系数，直接克隆一份即可。
         deformed_gs_shs = gs_shs.clone()
-        
+
+
+        #         | 状态                   | 说明                                                                                                             |
+# | -------------------- | -------------------------------------------------------------------------------------------------------------- |
+# | **Canonical**（规范化状态） | 顶点／高斯点处于 SMPL 模板定义的“标准”姿态下（通常是 Vitruvian pose 或 T-pose），只包含初始的形状偏移（shape\_offsets）和模型级别的模板参数，没有任何关节驱动的形变或外部变换。 |
+# | **Deformed**（变形后状态）  | 顶点／高斯点应用了骨骼绑定（LBS）、pose-dirs、全局旋转缩放平移，甚至可能再叠加了一次外部仿射变换之后的位置。                                                   |
+
+        # 返回字典
+        #     xyz: 变形并应用所有缩放、平移和外部变换后的高斯中心
+        #     xyz_canon: canonical（未变形）状态下的高斯中心
+        #     xyz_offsets: 几何偏移（geometry decoder 输出）
+        #     scales / scales_canon: 最终与 canonical 的尺度
+        #     rotq / rotmat: 变形后高斯的旋转（四元数和矩阵）
+        #     rotq_canon / rotmat_canon: canonical 姿态下的旋转
+        #     rot6d_canon: canonical 的 6D 旋转表示
+        #     shs: spherical harmonics 系数
+        #     opacity: 透明度
+        #     normals / normals_canon: 变形后与 canonical 下的法向
+        #     active_sh_degree: 当前 SH 阶数
+        #     lbs_weights, posedirs: 用于 LBS 的权重和偏移方向
+        #     gt_lbs_weights: SMPL 原生权重的 ground-truth，用于正则化
         return {
             'xyz': deformed_xyz,
             'xyz_canon': gs_xyz,
