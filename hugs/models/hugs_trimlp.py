@@ -380,15 +380,37 @@ class HUGS_TRIMLP:
             rotq = matrix_to_quaternion(rotmat)
             deformed_gs_rotq = quaternion_multiply(rotq, deformed_gs_rotq)
             deformed_gs_rotmat = quaternion_to_matrix(deformed_gs_rotq)
-        
+
+        # 构造一个与 gs_xyz 同 shape 的向量组，所有法向初始设为 (0,0,1)，表示 canonical 状态下的“上”方向。
         self.normals = torch.zeros_like(gs_xyz)
         self.normals[:, 2] = 1.0
-        
+
+        # canon_normals：将默认法向通过 canonical 旋转 gs_rotmat 变换，得到 canonical 姿态下每个高斯的真实法向。
         canon_normals = (gs_rotmat @ self.normals.unsqueeze(-1)).squeeze(-1)
+        # deformed_normals：再用最终的 posed 旋转 deformed_gs_rotmat 变换，得到变形后每个高斯的法向。
         deformed_normals = (deformed_gs_rotmat @ self.normals.unsqueeze(-1)).squeeze(-1)
-        
+        # 由于外部变换只影响空间位置和旋转，不改变 spherical harmonics 系数，直接克隆一份即可。
         deformed_gs_shs = gs_shs.clone()
-        
+
+#         | 状态                   | 说明                                                                                                             |
+# | -------------------- | -------------------------------------------------------------------------------------------------------------- |
+# | **Canonical**（规范化状态） | 顶点／高斯点处于 SMPL 模板定义的“标准”姿态下（通常是 Vitruvian pose 或 T-pose），只包含初始的形状偏移（shape\_offsets）和模型级别的模板参数，没有任何关节驱动的形变或外部变换。 |
+# | **Deformed**（变形后状态）  | 顶点／高斯点应用了骨骼绑定（LBS）、pose-dirs、全局旋转缩放平移，甚至可能再叠加了一次外部仿射变换之后的位置。                                                   |
+
+        # 返回字典
+        #     xyz: 变形并应用所有缩放、平移和外部变换后的高斯中心
+        #     xyz_canon: canonical（未变形）状态下的高斯中心
+        #     xyz_offsets: 几何偏移（geometry decoder 输出）
+        #     scales / scales_canon: 最终与 canonical 的尺度
+        #     rotq / rotmat: 变形后高斯的旋转（四元数和矩阵）
+        #     rotq_canon / rotmat_canon: canonical 姿态下的旋转
+        #     rot6d_canon: canonical 的 6D 旋转表示
+        #     shs: spherical harmonics 系数
+        #     opacity: 透明度
+        #     normals / normals_canon: 变形后与 canonical 下的法向
+        #     active_sh_degree: 当前 SH 阶数
+        #     lbs_weights, posedirs: 用于 LBS 的权重和偏移方向
+        #     gt_lbs_weights: SMPL 原生权重的 ground-truth，用于正则化
         return {
             'xyz': deformed_xyz,
             'xyz_canon': gs_xyz,
@@ -421,9 +443,17 @@ class HUGS_TRIMLP:
         is_train=False,
         ext_tfs=None,
     ):
-        
+        # tri_feats.shape=(N, 3×features)
         tri_feats = self.triplane(self.get_xyz)
+
+        # return {'shs': shs, 'opacity': opacity}
         appearance_out = self.appearance_dec(tri_feats)
+        
+        # return {
+            # 'xyz': xyz,
+            # 'rotations': rotations,
+            # 'scales': scales,
+        # }
         geometry_out = self.geometry_dec(tri_feats)
         
         xyz_offsets = geometry_out['xyz']
@@ -444,9 +474,25 @@ class HUGS_TRIMLP:
         gs_scales_canon = gs_scales.clone()
         
         if self.use_deformer:
+            # return {
+            #     'lbs_weights': lbs_weights,
+            #     'posedirs': posedirs if not self.disable_posedirs else None,
+            # }
+            # 对于每个高斯点，它对 SMPL 模型中 各个关节 的线性混合权重（Linear Blend Skinning）是多少。
+            #     lbs_weights.shape = [N, 24]（如果 SMPL 是 24 个关节）
+            #     用于后续计算：
+            #         deformed_xyz = lbs_extra(..., lbs_weights, posedirs, ...)
+            #         ！！→ 把静态的 xyz 通过骨骼姿态变成动态位置。！！
+            # ⚠️ 不是高斯偏移的原因是：
+                # 高斯偏移已经在 geometry_out['xyz'] 中输出；
+                # deformation_out 专注于“如何跟随 SMPL 动起来”的部分；
             deformation_out = self.deformation_dec(tri_feats)
             lbs_weights = deformation_out['lbs_weights']
+            
+            # 对 LBS 权重做归一化，因为 LBS 是线性加权平均，权重之和必须为 1。
             lbs_weights = F.softmax(lbs_weights/0.1, dim=-1)
+            
+            # posedirs: 高斯点在关节旋转下的局部偏移响应方向
             posedirs = deformation_out['posedirs']
             if abs(lbs_weights.sum(-1).mean().item() - 1) < 1e-7:
                 pass
@@ -472,6 +518,11 @@ class HUGS_TRIMLP:
         
         # vitruvian -> t-pose -> posed
         # remove and reapply the blendshape
+        # 最终，smpl_output 包含：
+        #     vertices：(1, V, 3) 顶点坐标
+        #     A、T：关节变换矩阵：： 形状：A 是一个张量，通常大小 (J, 4, 4)，J 是关节数（SMPL 中为 24 或 23）。：： 形状：T 是一个张量，大小 (V, 4, 4)，V 是网格顶点数。
+        #     shape_offsets、pose_offsets：blendshape 偏移
+        #     full_pose：23×3 轴角表示
         smpl_output = self.smpl(
             betas=betas.unsqueeze(0),
             body_pose=body_pose.unsqueeze(0),
@@ -479,11 +530,29 @@ class HUGS_TRIMLP:
             disable_posedirs=False,
             return_full_pose=True,
         )
-        
+
+        # — 先初始化真实权重变量，用于后面计算 gt_lbs_weights（ground-truth LBS weights）。
         gt_lbs_weights = None
+
         if self.use_deformer:
+            
+            # 取出 SMPL 输出中第 0（batch）帧的关节变换矩阵 A，形状 (J,4,4)。
             A_t2pose = smpl_output.A[0]
+
+            # 将模板（Vitruvian）→T-pose的逆变换 inv_A_t2vitruvian 与当前姿态关节变换 A_t2pose 相乘，
+            # 得到 “Vitruvian → posed” 的每个关节变换。
             A_vitruvian2pose = A_t2pose @ self.inv_A_t2vitruvian
+    
+            # 输入
+            #     A_vitruvian2pose[None]：每个关节“模板→姿态”的 4×4 变换
+            #     gs_xyz[None]：要做骨骼绑定的高斯点位置，xyz_offsets后的高斯点，如果 gs_xyz 的 shape 是 (N, 3)，那么 gs_xyz[None] 就会变成 shape (1, N, 3)。
+            #     posedirs：每个点在关节旋转下的位移方向集合
+            #     lbs_weights：预测得到的每个点对每个关节的权重
+            #     smpl_output.full_pose：SMPL 的当前轴角参数
+            # 输出
+            #     deformed_xyz：骨骼绑定后高斯点的新位置 (1, N, 3)
+            #     lbs_T：每个点的最终 4×4 LBS 变换矩阵 (1, N, 4, 4)
+            #     中间还有其他返回值，用 _ 忽略。
             deformed_xyz, _, lbs_T, _, _ = lbs_extra(
                 A_vitruvian2pose[None], gs_xyz[None], posedirs, lbs_weights, 
                 smpl_output.full_pose, disable_posedirs=self.disable_posedirs, pose2rot=True
@@ -494,23 +563,32 @@ class HUGS_TRIMLP:
             with torch.no_grad():
                 # gt lbs is needed for lbs regularization loss
                 # predicted lbs should be close to gt lbs
+                
+                # 在不计算梯度的情况下，计算“真实”LBS 权重 gt_lbs_weights，用于做正则化损失。
                 _, gt_lbs_weights = smpl_lbsweight_top_k(
                     lbs_weights=self.smpl.lbs_weights,
                     points=gs_xyz.unsqueeze(0),
                     template_points=self.vitruvian_verts.unsqueeze(0),
                 )
                 gt_lbs_weights = gt_lbs_weights.squeeze(0)
+
+                # 确认 gt_lbs_weights 在每个点上总和为 1，否则打警告。
                 if abs(gt_lbs_weights.sum(-1).mean().item() - 1) < 1e-7:
                     pass
                 else:
                     logger.warning(f"GT LBS weights should sum to 1, but it is: {gt_lbs_weights.sum(-1).mean().item()}")
         else:
+            # SMPL 作形变时的模板偏移：shape_offsets + pose_offsets，取第 0 帧。
             curr_offsets = (smpl_output.shape_offsets + smpl_output.pose_offsets)[0]
             T_t2pose = smpl_output.T[0]
             T_vitruvian2t = self.inv_T_t2vitruvian.clone()
             T_vitruvian2t[..., :3, 3] = T_vitruvian2t[..., :3, 3] + self.canonical_offsets - curr_offsets
             T_vitruvian2pose = T_t2pose @ T_vitruvian2t
 
+            # 根据 SMPL 自带的 lbs_weights，对 gs_xyz 上的每个点：            
+            # 使用 T_vitruvian2pose（每顶点的 4×4 变换）
+            # 计算其对点的 LBS 变换矩阵 lbs_T（选取 top-K 骨骼以提高效率）
+            # 返回 lbs_T：形状 (1, N, 4, 4) → .squeeze(0) 得 (N,4,4)。
             _, lbs_T = smpl_lbsmap_top_k(
                 lbs_weights=self.smpl.lbs_weights,
                 verts_transform=T_vitruvian2pose.unsqueeze(0),
@@ -522,18 +600,27 @@ class HUGS_TRIMLP:
         
             homogen_coord = torch.ones_like(gs_xyz[..., :1])
             gs_xyz_homo = torch.cat([gs_xyz, homogen_coord], dim=-1)
+            
+            # 对每个点，把 (4×4) 的 lbs_T 矩阵左乘其齐次坐标，得到变形后位置 (x',y',z',w')，取前三维 (x',y',z') 即 deformed_xyz。
             deformed_xyz = torch.matmul(lbs_T, gs_xyz_homo.unsqueeze(-1))[..., :3, 0]
-        
+
+        # 全身缩放：smpl_scale 通常是一个形如 (3,) 或 (1,) 的张量，表示对整个 SMPL 变形结果做全局缩放。
         if smpl_scale is not None:
             deformed_xyz = deformed_xyz * smpl_scale.unsqueeze(0)
             gs_scales = gs_scales * smpl_scale.unsqueeze(0)
         
+        # 全身平移：transl 是一个 (3,) 的平移向量，加上它会将所有点沿 XYZ 平移相同量。
         if transl is not None:
             deformed_xyz = deformed_xyz + transl.unsqueeze(0)
-        
+
+        # 计算变形后每个高斯的旋转矩阵
+        #     lbs_T 是每个点的 4×4 LBS 变换矩阵，取它的前 3×3 子矩阵 lbs_T[:, :3, :3] 得到点在 posed 状态下的刚性旋转。
+        #     与 Canonical 状态下的旋转 gs_rotmat 相乘，可得到“先旋转到 canonical 朝向，再按 LBS 旋转到 posed 朝向”的复合旋转矩阵。
         deformed_gs_rotmat = lbs_T[:, :3, :3] @ gs_rotmat
+        # 将复合旋转矩阵转换为四元数表示，便于后续插值或与其他旋转相乘。
         deformed_gs_rotq = matrix_to_quaternion(deformed_gs_rotmat)
-        
+
+        # 应用外部仿射变换（可选）
         if ext_tfs is not None:
             tr, rotmat, sc = ext_tfs
             deformed_xyz = (tr[..., None] + (sc[None] * (rotmat @ deformed_xyz[..., None]))).squeeze(-1)
@@ -678,6 +765,7 @@ class HUGS_TRIMLP:
 
         # ✅ 将旋转矩阵转换为：
         #     rotq: 四元数表示（用于插值等任务）
+        
         #     rot6d: 6D 旋转表示（避免欧拉角/Gimbal锁问题，适合网络学习）
         rotq = matrix_to_quaternion(norm_rotmat)
         rot6d = matrix_to_rotation_6d(norm_rotmat)
