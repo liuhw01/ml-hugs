@@ -223,10 +223,23 @@ class NeumanDataset(torch.utils.data.Dataset):
         smpl_params = np.load(smpl_params_path)
         smpl_params = {f: smpl_params[f] for f in smpl_params.files}
 
-        
+        # 为了 驱动动画（驱动 SMPL 骨架产生连续动作序列）
         if split == 'anim':
+            #             | 内容                                           | 说明                                            |
+            # | -------------------------------------------- | --------------------------------------------- |
+            # | `'./data/SFU/0008/0008_ChaCha001_poses.npz'` | 存储 SMPL 动作参数（`pose`）的 `.npz` 文件，描述的是“ChaCha舞” |
+            # | `0`                                          | 起始帧索引，从 MoCap 文件中第 0 帧开始使用                    |
+            # | `1000`                                       | 终止帧索引，使用到第 1000 帧（不含）                         |
+            # | `4`                                          | 时间步采样率，每隔 4 帧取一帧，即 `0, 4, 8, ..., 996`        |
+            # ① 加载动作数据（MoCap）
+            #     mocap_path(seq)：根据当前序列名称（如 'lab'）返回指定动作文件路径和起始、终止帧、采样间隔。
+            #     np.load(motion_path)：加载 .npz 动作文件，包含：
+            #     poses: (N, 156) 维，SMPL-H 格式的关节角度参数
+            #     trans: (N, 3)，每一帧的平移向量
             motion_path, start_idx, end_idx, skip = mocap_path(seq)
             motions = np.load(motion_path)
+            
+            # AMASS_SMPLH_TO_SMPL_JOINTS：索引映射，将 AMASS / SMPL-H 中的 52 维身体 pose 映射为 SMPL 所需的 23 维身体 pose（每个关节3轴旋转，共 23×3=69 维）。
             poses = motions['poses'][start_idx:end_idx:skip, AMASS_SMPLH_TO_SMPL_JOINTS]
             transl = motions['trans'][start_idx:end_idx:skip]
             betas = smpl_params['betas'][0]
@@ -237,12 +250,20 @@ class NeumanDataset(torch.utils.data.Dataset):
                 'scale': np.array([1.0] * poses.shape[0]),
                 'betas': betas[None].repeat(poses.shape[0], 0)[:, :10],
             }
-            
+
+            # alignment(seq) 是一个自定义函数，返回当前序列手动设置的：
+            #     平移（translation）
+            #     旋转角度（euler）
+            #     缩放比例
+            #     这些是为了 将动作坐标系对齐到场景坐标系。
             manual_trans, manual_rot, manual_scale = alignment(seq)
             manual_rotmat = transformations.euler_matrix(*manual_rot)[:3, :3]
             self.manual_rotmat = torch.from_numpy(manual_rotmat).float().unsqueeze(0)
             self.manual_trans = torch.from_numpy(manual_trans).float().unsqueeze(0)
             self.manual_scale = torch.tensor([manual_scale]).float().unsqueeze(0)
+            
+            # 生成一个虚拟的 scene.captures，每一帧对应一帧动作，将渲染准备好
+            # 实际渲染可能使用固定视角或预定义路径合成“动画演示”
             nframes = poses.shape[0]
             caps = rendering_caps(seq, nframes, scene)
             scene.captures = caps
@@ -250,10 +271,14 @@ class NeumanDataset(torch.utils.data.Dataset):
             self.train_split, _, self.val_split = get_data_splits(scene)
         
         self.scene = scene
-        
+
+        # 从点云中提取前三列数据，即每个点的 3D 坐标 (X, Y, Z)。
         pcd_xyz = self.scene.point_cloud[:, :3]
+        # 从点云中提取 RGB 颜色信息，即第4到第6列。
         pcd_col = self.scene.point_cloud[:, 3:6] / 255.
-        
+
+        # 🧼 1. clean_pcd: 清除点云离群点
+        # 利用 Open3D 执行统计离群点剔除
         if clean_pcd:
             import open3d as o3d
             scene_pcd = o3d.geometry.PointCloud()
@@ -266,6 +291,7 @@ class NeumanDataset(torch.utils.data.Dataset):
             pcd_xyz = pcd_xyz[inlier_ind]
             pcd_col = pcd_col[inlier_ind]
 
+        # 添加背景球面点（稀疏点包围场景）
         if add_bg_points:
             # find the scene center and size
             point_max_coordinate = np.max(pcd_xyz, axis=0)
@@ -294,28 +320,46 @@ class NeumanDataset(torch.utils.data.Dataset):
             pcd.colors = o3d.utility.Vector3dVector(pcd_col)
             o3d.io.write_point_cloud(f'./output/{seq}_bg_sphere.ply', pcd)
             logger.debug(f"Added {len(bg_sphere_point_xyz)} background points, saved to output/{seq}_bg_sphere.ply")
-        
+
+        # pcd_xyz 通常包含的是 全场景的静态点云（static scene point cloud），不包括人体的高斯点。
+        # 人体点（即动态人身体对应的高斯）是单独建模的：它们初始放置在 SMPL 网格顶点位置
+        # 3. 初始化 BasicPointCloud
         self.init_pcd = BasicPointCloud(
             points=pcd_xyz, 
             colors=pcd_col, 
             normals=np.zeros_like(pcd_xyz), 
             faces=None
         )
-        
+
+        # 人体点（即动态人身体对应的高斯）是单独建模的：它们初始放置在 SMPL 网格顶点位置
+        # 字段包括：
+        #     global_orient: N × 3
+        #     body_pose: N × 69
+        #     transl: N × 3
+        #     betas: N × 10
+        #     scale: N × 1
         self.smpl_params = {}
         for k in smpl_params.keys():
             self.smpl_params[k] = torch.from_numpy(smpl_params[k]).float()
-        
+
+        # 5. 加载 SAM 分割掩码
+        # 每帧图像的人体二值分割结果，来自 Segment Anything Model（SAM）
         self.sam_mask_dir = f'{dataset_path}/4d_humans/sam_segmentations'
         self.msk_lists = sorted(glob.glob(f"{self.sam_mask_dir}/*.png"))
-        
+
+        # 📏 6. 计算相机分布的对角尺度（用于确定场景半径）
+        # 🔍 目的：计算整个相机阵列的空间范围，并据此设定一个合适的渲染半径（self.radius）
         _, diag = get_center_and_diag([cap.cam_pose.camera_center_in_world for cap in scene.captures])
-    
+        # 设置一个比场景尺度稍大的球形半径
+        #     常用于：
+        #     视角采样范围限制（如球面轨迹）
+        #     虚拟相机轨迹生成
+        #     渲染时高斯点的可视剔除范围
         self.radius = diag * 1.1
         
-        self.split = split
-        self.mode = render_mode
-        
+        # 📅 7. 设置帧数和模式
+        self.split = split # train / val / anim
+        self.mode = render_mode # render_mode='human_scene',
         self.num_frames = len(self.scene.captures)    
 
         self.cached_data = None
