@@ -35,7 +35,7 @@ def render_human_scene(
     render_human_separate=False,
 ):
 
-    # 🔹 Step 1：根据 render_mode 构建高斯属性
+    # Step 1：根据 render_mode 合并高斯
     feats = None
     if render_mode == 'human_scene':
         feats = torch.cat([human_gs_out['shs'], scene_gs_out['shs']], dim=0)
@@ -95,7 +95,11 @@ def render_human_scene(
         render_pkg['human_visibility_filter'] = render_human_pkg['visibility_filter']
         render_pkg['human_radii'] = render_human_pkg['radii']
 
-    # 🔹 Step 4：可选：记录 visibility_filter
+# Step 4：设置各部分的可见性信息
+# 在 human_scene 模式中，我们需要从混合的 visibility/radii 中分离出：
+# 人体部分的 visibility
+# 场景部分的 visibility
+    # 目的是后续 densify() 时分开处理人体和场景高斯。
     if render_mode == 'human':
         render_pkg['human_visibility_filter'] = render_pkg['visibility_filter']
         render_pkg['human_radii'] = render_pkg['radii']
