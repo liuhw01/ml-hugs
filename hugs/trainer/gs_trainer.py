@@ -549,26 +549,40 @@ class GaussianTrainer():
                 max_n_gs=self.cfg.human.max_n_gaussians,
             )
     
+    # 这段代码定义了 HUGS 模型的验证函数 validate，用于评估当前高斯模型在验证集上的表现。它会：
+    # 执行正向渲染
+    # 与真实图像进行比对
+    # 计算评价指标（PSNR, SSIM, LPIPS）
+    # 保存对比图像
+    # 存储验证结果
     @torch.no_grad()
     def validate(self, iter=None):
-        
+
+        # iter_s: 用于保存图像和日志的标识（如果没有提供迭代次数就是 "final"）
+        # bg_color: 渲染背景设为黑色 [0, 0, 0]
         iter_s = 'final' if iter is None else f'{iter:06d}'
-        
         bg_color = torch.zeros(3, dtype=torch.float32, device="cuda")
-        
+
+        # 👤 切换人体模型为 eval 模式（不影响场景模型）
         if self.human_gs:
             self.human_gs.eval()
-                
+
+        # 📊 初始化指标容器
         methods = ['hugs', 'hugs_human']
         metrics = ['lpips', 'psnr', 'ssim']
+        # 初始化字典，如：
         metrics = dict.fromkeys(['_'.join(x) for x in itertools.product(methods, metrics)])
         metrics = {k: [] for k in metrics}
-        
+
+        # 🔁 遍历验证集进行评估
+        # 每帧验证数据包含：data['rgb']、smpl 参数、bbox、mask等。
         for idx, data in enumerate(tqdm(self.val_dataset, desc="Validation")):
             human_gs_out, scene_gs_out = None, None
             render_mode = self.cfg.mode
             
             if self.human_gs:
+                # ✅ 1. 运行人体高斯（如果启用）
+                # 使用 smpl 参数 + betas + transl 推理出当前帧的高斯位置和属性。
                 human_gs_out = self.human_gs.forward(
                     global_orient=data['global_orient'], 
                     body_pose=data['body_pose'], 
@@ -581,6 +595,8 @@ class GaussianTrainer():
                 )
                 
             if self.scene_gs:
+                # ✅ 2. 场景高斯 forward（在一定迭代后才会激活）
+                # 使用 render_human_scene 渲染当前帧（整合人体和场景高斯），输出为图像张量。
                 if iter is not None:
                     if iter >= self.cfg.scene.opt_start_iter:
                         scene_gs_out = self.scene_gs.forward()
@@ -588,7 +604,8 @@ class GaussianTrainer():
                         render_mode = 'human'
                 else:
                     scene_gs_out = self.scene_gs.forward()
-                    
+
+            # ✅ 3. 渲染合成图像
             render_pkg = render_human_scene(
                 data=data, 
                 human_gs_out=human_gs_out, 
@@ -603,32 +620,36 @@ class GaussianTrainer():
             if self.cfg.dataset.name == 'zju':
                 image = image * data['mask']
                 gt_image = gt_image * data['mask']
-            
+                
+            # 📏 计算指标（全图）
             metrics['hugs_psnr'].append(psnr(image, gt_image).mean().double())
             metrics['hugs_ssim'].append(ssim(image, gt_image).mean().double())
             metrics['hugs_lpips'].append(self.lpips(image.clip(max=1), gt_image).mean().double())
-            
+
+            # 💾 保存整图对比结果
             log_img = torchvision.utils.make_grid([gt_image, image], nrow=2, pad_value=1)
             imf = f'{self.cfg.logdir}/val/full_{iter_s}_{idx:03d}.png'
             os.makedirs(os.path.dirname(imf), exist_ok=True)
             torchvision.utils.save_image(log_img, imf)
             
             log_img = []
+            # 🧍 如果是人体模式，额外裁剪 bbox 区域
             if self.cfg.mode in ['human', 'human_scene']:
                 bbox = data['bbox'].to(int)
                 cropped_gt_image = gt_image[:, bbox[0]:bbox[2], bbox[1]:bbox[3]]
                 cropped_image = image[:, bbox[0]:bbox[2], bbox[1]:bbox[3]]
                 log_img += [cropped_gt_image, cropped_image]
                 
+                # 获取人体在图像中的 bbox，计算该区域的指标。
                 metrics['hugs_human_psnr'].append(psnr(cropped_image, cropped_gt_image).mean().double())
                 metrics['hugs_human_ssim'].append(ssim(cropped_image, cropped_gt_image).mean().double())
                 metrics['hugs_human_lpips'].append(self.lpips(cropped_image.clip(max=1), cropped_gt_image).mean().double())
-            
+            # 保存裁剪区域的对比图：
             if len(log_img) > 0:
                 log_img = torchvision.utils.make_grid(log_img, nrow=len(log_img), pad_value=1)
                 torchvision.utils.save_image(log_img, f'{self.cfg.logdir}/val/human_{iter_s}_{idx:03d}.png')
         
-        
+        # 📊 汇总所有指标并保存为 .pth
         self.eval_metrics[iter_s] = {}
         
         for k, v in metrics.items():
