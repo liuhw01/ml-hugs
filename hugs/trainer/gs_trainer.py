@@ -320,7 +320,13 @@ class GaussianTrainer():
             else:
                 human_bg_color = None
                 render_human_separate = False
-            
+
+            #         | 字段名                 | 含义                       |
+            # | ------------------- | ------------------------ |
+            # | `render`            | 最终图像，shape 为 `(3, H, W)` |
+            # | `viewspace_points`  | 每个高斯的 2D 屏幕坐标（实际由渲染器写入）  |
+            # | `visibility_filter` | 每个高斯是否被渲染器视锥覆盖           |
+            # | `radii`             | 每个高斯在图像平面上的投影半径（越大越靠近相机） |
             render_pkg = render_human_scene(
                 data=data, 
                 human_gs_out=human_gs_out, 
@@ -333,7 +339,8 @@ class GaussianTrainer():
             
             if self.human_gs:
                 self.human_gs.init_values['edges'] = self.human_gs.edges
-                        
+
+            
             loss, loss_dict, loss_extras = self.loss_fn(
                 data,
                 render_pkg,
@@ -364,6 +371,7 @@ class GaussianTrainer():
             if t_iter == self.cfg.train.num_steps:
                 pbar.close()
 
+            # 🖼 每 1000 步保存可视化渲染图
             if t_iter % 1000 == 0:
                 with torch.no_grad():
                     pred_img = loss_extras['pred_img']
@@ -372,16 +380,27 @@ class GaussianTrainer():
                     log_gt_img = (gt_img.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
                     log_img = np.concatenate([log_gt_img, log_pred_img], axis=1)
                     save_images(log_img, f'{self.cfg.logdir}/train/{t_iter:06d}.png')
-            
+
+            # 🧩 Scene 高斯动态 densify（体素分裂）
             if t_iter >= self.cfg.scene.opt_start_iter:
+                # 是否还在 densify 区间内：
                 if (t_iter - self.cfg.scene.opt_start_iter) < self.cfg.scene.densify_until_iter and self.cfg.mode in ['scene', 'human_scene']:
+                    # 提取场景的 viewspace_point（screenspace_points），用于导数判断：
                     render_pkg['scene_viewspace_points'] = render_pkg['viewspace_points']
                     render_pkg['scene_viewspace_points'].grad = render_pkg['viewspace_points'].grad
-                        
+                    
+                    # 记录梯度均值和方差（调试用）：
                     sgrad_mean, sgrad_std = render_pkg['scene_viewspace_points'].grad.mean(), render_pkg['scene_viewspace_points'].grad.std()
                     sgrad_means.append(sgrad_mean.item())
                     sgrad_stds.append(sgrad_std.item())
+                    
                     with torch.no_grad():
+                        # scene_densification 函数负责 动态地细化（densify）和剪枝（prune）场景中的高斯点
+                        # 传入参数：
+                        #     visibility_filter：一个布尔张量，标记哪些高斯在当前视角可见。
+                        #     radii：当前视角下每个高斯在屏幕上的半径（投影尺度）。                            
+                        #     viewspace_point_tensor：具有梯度的屏幕空间位置，用于感知哪些高斯重要。                          
+                        #     iteration：当前训练迭代步数。
                         self.scene_densification(
                             visibility_filter=render_pkg['scene_visibility_filter'],
                             radii=render_pkg['scene_radii'],
@@ -418,7 +437,8 @@ class GaussianTrainer():
             # run validation
             if t_iter % self.cfg.train.val_interval == 0 and t_iter > 0:
                 self.validate(t_iter)
-            
+
+            # 📸 初始化时保存初始模型 mesh 和 canonical 渲染
             if t_iter == 0:
                 if self.scene_gs:
                     self.scene_gs.save_ply(f'{self.cfg.logdir}/meshes/scene_{t_iter:06d}_splat.ply')
@@ -427,7 +447,11 @@ class GaussianTrainer():
 
                 if self.cfg.mode in ['human', 'human_scene']:
                     self.render_canonical(t_iter, nframes=self.cfg.human.canon_nframes)
-                
+
+            # 每 anim_interval 轮执行一次：
+                # 保存当前人体的 .ply
+                # 执行 self.animate(t_iter)（可能是一个小动画片段）
+                # 渲染 canonical pose 的图像序列（一般是环绕的 360° 摄像机）
             if t_iter % self.cfg.train.anim_interval == 0 and t_iter > 0 and self.cfg.train.anim_interval > 0:
                 if self.human_gs:
                     save_ply(human_gs_out, f'{self.cfg.logdir}/meshes/human_{t_iter:06d}_splat.ply')
@@ -436,11 +460,13 @@ class GaussianTrainer():
                     
                 if self.cfg.mode in ['human', 'human_scene']:
                     self.render_canonical(t_iter, nframes=self.cfg.human.canon_nframes)
-            
+
+            # 每 1000 步增长一次 SH 表达能力（颜色更精细），调用：
             if t_iter % 1000 == 0 and t_iter > 0:
-                if self.human_gs: self.human_gs.oneupSHdegree()
-                if self.scene_gs: self.scene_gs.oneupSHdegree()
-                
+                if self.human_gs: self.human_gs.oneupSHdegree()  # self.active_sh_degree += 1
+                if self.scene_gs: self.scene_gs.oneupSHdegree()  # self.active_sh_degree += 1
+
+            # 🖼️ 渲染训练进度图像（可用于视频）
             if self.cfg.train.save_progress_images and t_iter % self.cfg.train.progress_save_interval == 0 and self.cfg.mode in ['human', 'human_scene']:
                 self.render_canonical(t_iter, nframes=2, is_train_progress=True)
         
@@ -462,24 +488,42 @@ class GaussianTrainer():
             self.scene_gs.save_ply(f'{self.cfg.logdir}/meshes/scene_{iter_s}_splat.ply')
             
         logger.info(f'Saved checkpoint {iter_s}')
-                
+
+    # scene_densification 函数负责 动态地细化（densify）和剪枝（prune）场景中的高斯点
+        # 传入参数：
+        #     visibility_filter：一个布尔张量，标记哪些高斯在当前视角可见。
+        #     radii：当前视角下每个高斯在屏幕上的半径（投影尺度）。                            
+        #     viewspace_point_tensor：具有梯度的屏幕空间位置，用于感知哪些高斯重要。                          
+        #     iteration：当前训练迭代步数。
     def scene_densification(self, visibility_filter, radii, viewspace_point_tensor, iteration):
+        # 1️⃣ 记录最大可见屏幕半径
         self.scene_gs.max_radii2D[visibility_filter] = torch.max(
             self.scene_gs.max_radii2D[visibility_filter], 
             radii[visibility_filter]
         )
+        
+        # 2️⃣ 累积 densification 统计信息
+        # 这一步将 当前梯度值 和其他相关信息累计到 scene_gs 中，用于分析高斯点的重要性（如哪些点梯度较大、活跃度高）。
+            # 📊 为什么要记录这些信息？
+                # 这些累积梯度统计用于判断高斯点是否应该 densify（复制细化）：
+                # 梯度大 → 说明该点对图像误差贡献大 → 应该复制更多细节。
+                # 梯度小 → 表示该点不重要，甚至可能被剪枝。
         self.scene_gs.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
+        # 3️⃣ 条件触发 densify & prune
+        # 在训练步数超过 densify_from_iter 后，且每隔 densification_interval 步，就执行一次高斯体素分裂和裁剪：
         if iteration > self.cfg.scene.densify_from_iter and iteration % self.cfg.scene.densification_interval == 0:
+            # size_threshold 限制了屏幕上的最大半径，大于这个的高斯不会再继续 split（控制密度上限）。
             size_threshold = 20 if iteration > self.cfg.scene.opacity_reset_interval else None
             self.scene_gs.densify_and_prune(
-                self.cfg.scene.densify_grad_threshold, 
-                min_opacity=self.cfg.scene.prune_min_opacity, 
-                extent=self.train_dataset.radius, 
-                max_screen_size=size_threshold,
-                max_n_gs=self.cfg.scene.max_n_gaussians,
+                self.cfg.scene.densify_grad_threshold,   # 梯度分裂阈值
+                min_opacity=self.cfg.scene.prune_min_opacity,  # 剪枝时最低 opacity
+                extent=self.train_dataset.radius,  # 空间范围限制
+                max_screen_size=size_threshold,    # 屏幕尺寸限制（optional） 
+                max_n_gs=self.cfg.scene.max_n_gaussians, # 高斯点总数上限
             )
-        
+            
+        # 4️⃣ 重置 Opacity（不透明度）
         is_white = self.bg_color.sum().item() == 3.
         
         if iteration % self.cfg.scene.opacity_reset_interval == 0 or (is_white and iteration == self.cfg.scene.densify_from_iter):
