@@ -475,6 +475,7 @@ class SceneGS:
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
 
         # 🧪 3. 对选中的点做扰动采样（Gaussian jitter）
+        # 以选中的高斯点为中心，在局部空间中生成 N 个扰动样本（用的是当前 scale 大小为 std）
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
 
