@@ -189,6 +189,13 @@ class GaussianTrainer():
                 #     create_body_pose：将 (N,69) 的 body_pose 注册为可学习参数，梯度由 cfg.human.optim_pose 控制。
                 #     create_global_orient：将 (N,3) 的 global_orient 注册为可学习参数。
                 #     create_transl：将 (N,3) 的 transl 注册为可学习参数，梯度由 cfg.human.optim_trans 控制。
+                # | 参数名             | 是否时序相关 | 维度               | 是否每一帧都不同？ | 说明                             |
+                    # | --------------- | ------ | ---------------- | --------- | ------------------------------ |
+                    # | `body_pose`     | ✅ 是    | `(N, 69)`        | ✅ 是       | 控制每帧关节姿态（如走路/坐下等），每帧都不同，必须单独优化 |
+                    # | `global_orient` | ✅ 是    | `(N, 3)`         | ✅ 是       | 控制每帧整体旋转，同样随时间变化               |
+                    # | `transl`        | ✅ 是    | `(N, 3)`         | ✅ 是       | 控制每帧位移，也随时间变化（走路等）             |
+                    # | `betas`         | ❌ 否    | `(10,)`          | ❌ 否       | 控制“身体形状”，一旦确定（身材特征），整段序列都共享    |
+                    # | `scale`         | ❌ 否    | `(1,)` or `(N,)` | 多为 ❌      | 全局缩放一般在数据预处理阶段就定好，不需要帧级优化      |
                 self.human_gs.create_body_pose(init_smpl_body_pose, cfg.human.optim_pose)
                 self.human_gs.create_global_orient(init_smpl_global_orient, cfg.human.optim_pose)
                 self.human_gs.create_transl(init_smpl_trans, cfg.human.optim_trans)
@@ -246,12 +253,23 @@ class GaussianTrainer():
             )
                 
         if cfg.mode in ['human', 'human_scene']:
+            # 通过 get_rotating_camera(...) 构造一个环绕人体旋转的相机轨迹，用于 canonical 状态下的可视化渲染或训练 supervision。
+            #     参数解释：
+            #     dist=5.0：相机到目标中心的距离为 5 个单位。
+            #     img_size=512：渲染图像分辨率（用于相机内参设定）。
+            #     nframes=cfg.human.canon_nframes：轨迹中生成多少帧（通常是 60 或 120）。
+            #     device='cuda'：相机参数生成在 GPU 上。
+            #     angle_limit=2π：生成 360° 环绕轨迹。
             self.canon_camera_params = get_rotating_camera(
                 dist=5.0, img_size=512, 
                 nframes=cfg.human.canon_nframes, device='cuda',
                 angle_limit=2*torch.pi,
             )
+
+            # ✅ 功能：获取 shape 参数 betas
             betas = self.human_gs.betas.detach() if hasattr(self.human_gs, 'betas') else self.train_dataset.betas[0]
+
+            # ✅ 功能：生成 canonical 姿态下的 SMPL 参数
             self.static_smpl_params = get_smpl_static_params(
                 betas=betas,
                 pose_type=self.cfg.human.canon_pose_type
