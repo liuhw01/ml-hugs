@@ -15,6 +15,7 @@ from smplx.lbs import (
 
 Tensor = NewType('Tensor', torch.Tensor)
 
+
 # 功能：在 SMPL 基础上，用自定义的 LBS 权重和 pose-dirs 对一批点（v_shaped）做线性混合蒙皮（Linear Blend Skinning），并返回变形后顶点、关节变换、最终顶点变换矩阵等信息。
 参数：
     # A: (B, J, 4, 4)，每个关节的齐次变换矩阵 (batch×joints)。
@@ -25,11 +26,11 @@ Tensor = NewType('Tensor', torch.Tensor)
     # disable_posedirs: 是否跳过 pose‐dirs 偏移（只做刚性变换）。
     # pose2rot: 如果 True，把 pose 视作 axis-angle，要先转换到旋转矩阵；否则已是矩阵。
 def lbs_extra(
-    A: Tensor,
-    v_shaped: Tensor,
-    posedirs: Tensor,
-    lbs_weights: Tensor,
-    pose: Tensor,
+    A: Tensor,  # (B, J, 4, 4) 每个关节的变换矩阵
+    v_shaped: Tensor, # (B, N, 3) 要做LBS的点 
+    posedirs: Tensor, # (P, N*3) pose blendshape basis
+    lbs_weights: Tensor, # (N, J) 每个点对每个关节的权重
+    pose: Tensor, # (B, (J+1)*3) 或 (B, J+1, 3, 3)
     disable_posedirs: bool = False,
     pose2rot: bool = True,
 ):
