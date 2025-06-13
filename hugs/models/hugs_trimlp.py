@@ -524,7 +524,16 @@ class HUGS_TRIMLP:
             # 将模板（Vitruvian）→T-pose的逆变换 inv_A_t2vitruvian 与当前姿态关节变换 A_t2pose 相乘，
             # 得到 “Vitruvian → posed” 的每个关节变换。
             A_vitruvian2pose = A_t2pose @ self.inv_A_t2vitruvian
-    
+
+
+            #### 变换位置和旋转到 posed space   lbs_extra
+            # | 属性        | 来源                                   | 是否变换到 posed space |
+            # | --------- | --------------------------------------- | -----------------——   |
+            # | `xyz`     | `self.get_xyz + xyz_offsets → lbs → ✔`  | ✅ 是                  |
+            # | `scales`  | `geometry_out['scales'] * smpl_scale`   | ✅ 跟随位移缩放          |
+            # | `rotmat`  | `lbs_T[:, :3, :3] @ canonical_rotation` | ✅ 是                  |
+            # | `shs`     | `appearance_out['shs']` → 不变           | ❌ 不需变（假定不随姿态） |
+            # | `opacity` | `appearance_out['opacity']`             | ❌ 不变                |
             # 输入
             #     A_vitruvian2pose[None]：每个关节“模板→姿态”的 4×4 变换
             #     gs_xyz[None]：要做骨骼绑定的高斯点位置，xyz_offsets后的高斯点，如果 gs_xyz 的 shape 是 (N, 3)，那么 gs_xyz[None] 就会变成 shape (1, N, 3)。
