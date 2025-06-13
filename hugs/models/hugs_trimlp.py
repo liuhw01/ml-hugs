@@ -436,6 +436,8 @@ class HUGS_TRIMLP:
             # 'rotations': rotations,
             # 'scales': scales,
         # }
+
+# 🔹阶段一：规范空间高斯构建（Canonical Gaussians）
         geometry_out = self.geometry_dec(tri_feats)
         
         xyz_offsets = geometry_out['xyz']
@@ -454,7 +456,22 @@ class HUGS_TRIMLP:
             gs_scales = torch.ones_like(gs_scales) * torch.mean(gs_scales, dim=-1, keepdim=True)
             
         gs_scales_canon = gs_scales.clone()
-        
+
+# ❗ 关键区别（能力 vs 效果）
+# | 方面                                    | `smpl_lbsmap_top_k` | `lbs_extra`   |
+# | ------------------------------------- | ------------------- | ------------- |
+# | **LBS 权重来源**                          | SMPL自带的固定模板           | 网络可学习         |
+# | **pose-induced deformation**（姿态引起的形变） | ❌ 无（刚性）             | ✅ 有（非线性响应）    |
+# | **posedirs 使用**                       | ❌ 未使用               | ✅ 使用          |
+# | **变形精度**                              | 仅仿射刚性变换             | 动作驱动的柔性形变     |
+# | **控制自由度**                             | 无法学习优化（只是应用）        | 可训练、可微、可精调    |
+# | **应用场景**                              | baseline、初始化        | 真实驱动/动画/拟人化效果 |
+
+
+# 🔹阶段二：是否使用 SMPL LBS 动作驱动，后续送入lbs_extra
+# 使用 deformation_decoder 解码得到：
+#     lbs_weights：高斯点对 SMPL 各骨骼的 LBS 权重
+#     posedirs：高斯点在骨骼旋转下的形变方向
         if self.use_deformer:
             # return {
             #     'lbs_weights': lbs_weights,
@@ -497,7 +514,8 @@ class HUGS_TRIMLP:
             
         if hasattr(self, 'transl') and transl is None:
             transl = self.transl[dataset_idx]
-        
+
+# 🔹阶段三：获取 SMPL 的当前姿态参数
         # vitruvian -> t-pose -> posed
         # remove and reapply the blendshape
         # 最终，smpl_output 包含：
@@ -575,7 +593,8 @@ class HUGS_TRIMLP:
             T_vitruvian2t = self.inv_T_t2vitruvian.clone()
             T_vitruvian2t[..., :3, 3] = T_vitruvian2t[..., :3, 3] + self.canonical_offsets - curr_offsets
             T_vitruvian2pose = T_t2pose @ T_vitruvian2t
-
+            
+# 🔹阶段四：执行 LBS，计算变形高斯位置与旋转（Motion-aware Gaussians），基于lbs_weights参数
             # 根据 SMPL 自带的 lbs_weights，对 gs_xyz 上的每个点：            
             # 使用 T_vitruvian2pose（每顶点的 4×4 变换）
             # 计算其对点的 LBS 变换矩阵 lbs_T（选取 top-K 骨骼以提高效率）
@@ -603,7 +622,8 @@ class HUGS_TRIMLP:
         # 全身平移：transl 是一个 (3,) 的平移向量，加上它会将所有点沿 XYZ 平移相同量。
         if transl is not None:
             deformed_xyz = deformed_xyz + transl.unsqueeze(0)
-
+            
+# 🔹阶段六：更新旋转、法向、最终属性
         # 计算变形后每个高斯的旋转矩阵
         #     lbs_T 是每个点的 4×4 LBS 变换矩阵，取它的前 3×3 子矩阵 lbs_T[:, :3, :3] 得到点在 posed 状态下的刚性旋转。
         #     与 Canonical 状态下的旋转 gs_rotmat 相乘，可得到“先旋转到 canonical 朝向，再按 LBS 旋转到 posed 朝向”的复合旋转矩阵。
